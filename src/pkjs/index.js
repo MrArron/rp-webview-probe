@@ -108,6 +108,27 @@ function pageMain(S) {
   $('pasteBox').addEventListener('input', function() {
     $('pasteLen').textContent = 'Pasted ' + $('pasteBox').value.length + ' characters.';
   });
+  // Copies of a set size, made in the page, to find the clipboard's limit.
+  function sized(kb) {
+    var out = [];
+    var len = 0;
+    for (var i = 0; len < kb * 1024; i++) {
+      var line = '2026-09-26 14:03:12  D3 14:03  button  entry ' + i + ': up, down, select';
+      out.push(line);
+      len += line.length + 1;
+    }
+    return out.join(String.fromCharCode(10)).slice(0, kb * 1024);
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-copykb]'), function(b) {
+    b.onclick = function() {
+      var kb = +b.getAttribute('data-copykb');
+      tryExecCopy('Copy ' + kb + ' KB', sized(kb));
+    };
+  });
+  $('pasteClear').onclick = function() {
+    $('pasteBox').value = '';
+    $('pasteLen').textContent = '';
+  };
   $('pasteRec').onclick = function() {
     record('Pasted back', $('pasteBox').value.length + ' characters');
   };
@@ -239,8 +260,11 @@ function buildPage(state, pad) {
     '<h2>Copy</h2>' +
     row('<button id="copyApi">Copy small (clipboard API)</button><button id="copyExec">Copy small (execCommand)</button>' +
         '<button id="copyBig">Copy padding (execCommand)</button><button id="copyBigApi">Copy padding (clipboard API)</button>' +
+        '<p>Copy a set size:</p>' + [32, 64, 128, 256, 384, 512].map(function(kb) {
+          return '<button data-copykb="' + kb + '">' + kb + ' KB</button>';
+        }).join('') +
         '<p>Long-press here and Paste after each copy:</p><textarea id="pasteBox"></textarea>' +
-        '<p id="pasteLen"></p><button id="pasteRec">Record pasted length</button>') +
+        '<p id="pasteLen"></p><button id="pasteRec">Record pasted length</button><button id="pasteClear">Clear box</button>') +
     '<h2>Internet</h2>' +
     row('<button id="net">Try to reach Google from the page</button>') +
     '<h2>Finish</h2>' +
