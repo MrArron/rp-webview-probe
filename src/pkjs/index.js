@@ -217,7 +217,9 @@ function pageMain(S) {
   };
   $('close').onclick = function() {
     var next = parseInt($('nextKB').value, 10) || 0;
-    document.location = 'pebblejs://close#' + encodeURIComponent(JSON.stringify({results: results, next: next}));
+    document.location = 'pebblejs://close#' + encodeURIComponent(JSON.stringify({
+      results: results, next: next, storageTest: $('storageTest').checked
+    }));
   };
   $('nextKB').value = String(S.sizeKB);
 }
@@ -272,6 +274,8 @@ function buildPage(state, pad) {
     '<option value="256">256 KB</option><option value="512">512 KB</option><option value="1024">1 MB</option>' +
     '<option value="1152">1.125 MB</option><option value="1280">1.25 MB</option>' +
     '<option value="1536">1.5 MB</option><option value="2048">2 MB</option><option value="4096">4 MB</option></select></label><br>' +
+    '<label><input type="checkbox" id="storageTest"> Test phone storage after closing ' +
+    '(takes up to a minute; keep the app open on the watch, then open this page again)</label><br>' +
     '<button id="copyResults">Copy results</button><button id="close">Save results and close</button>' +
     '<h2>Earlier runs</h2><div id="runs"></div>' +
     '<textarea id="pad" readonly>' + pad + '</textarea>' +
@@ -294,7 +298,119 @@ function addRun(sizeKB, returnKB, results) {
   save(STORE_RUNS, runs.slice(-8));
 }
 
+// Phone storage quota test. Royal Pebble's usage log (up to 768 KB of text)
+// lives in the phone script's localStorage beside the cruise bundle, so this
+// finds how much that storage takes: one key growing to 8 MB, then 512 KB keys
+// adding up to 16 MB. Sizes are in K characters (JS strings; a store may count
+// 2 bytes each). Every test key is removed afterwards. Progress is saved after
+// each step, so a script that gets stopped part way still leaves a result.
+var STORE_QUOTA = 'probeQuotaProgress'; // [text] while the test runs
+var QUOTA_KEY = 'probeQuotaTest';
+var QUOTA_MULTI = 'probeQuotaMulti';
+
+function quotaBlock(kb) {
+  var s = padText(64).slice(0, 64 * 1024);
+  while (s.length < kb * 1024) {
+    s += s;
+  }
+  return s.slice(0, kb * 1024);
+}
+
+function trySet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    var back = localStorage.getItem(key);
+    return back !== null && back.length === value.length ? 'ok' : 'read back ' + (back ? back.length : 'nothing');
+  } catch (e) {
+    return 'error: ' + e;
+  }
+}
+
+function existingUsage() {
+  var chars = 0;
+  var keys = 0;
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      var v = localStorage.getItem(k);
+      chars += k.length + (v ? v.length : 0);
+      keys++;
+    }
+  } catch (e) {
+    return 'could not count: ' + e;
+  }
+  return keys + ' keys, ' + Math.round(chars / 1024) + ' K chars';
+}
+
+function runStorageTest() {
+  var out = [];
+  function note(text) {
+    out.push(text);
+    try { save(STORE_QUOTA, out); } catch (e) {} // storage may be full right now
+    console.log('Storage test: ' + text);
+  }
+  note('Storage before test: ' + existingUsage());
+
+  // 1. One key, growing.
+  var best = 0;
+  [256, 512, 768, 1024, 2048, 3072, 4096, 6144, 8192].some(function(kb) {
+    var t0 = Date.now();
+    var r = trySet(QUOTA_KEY, quotaBlock(kb));
+    note('One key ' + kb + ' K: ' + r + ' (' + (Date.now() - t0) + ' ms)');
+    if (r !== 'ok') {
+      return true;
+    }
+    best = kb;
+    return false;
+  });
+  try { localStorage.removeItem(QUOTA_KEY); } catch (e) {}
+  note('Largest single value saved: ' + best + ' K chars');
+
+  // 2. Log-sized save and load timing (the log is saved after new entries).
+  var log = JSON.stringify([quotaBlock(768)]);
+  var t1 = Date.now();
+  var r768 = trySet(QUOTA_KEY, log);
+  var t2 = Date.now();
+  var parsed = null;
+  try { parsed = JSON.parse(localStorage.getItem(QUOTA_KEY)); } catch (e) {}
+  note('768 K log as JSON: save ' + r768 + ' in ' + (t2 - t1) + ' ms, load and parse ' +
+       (parsed ? 'ok' : 'failed') + ' in ' + (Date.now() - t2) + ' ms');
+  try { localStorage.removeItem(QUOTA_KEY); } catch (e) {}
+
+  // 3. Many 512 K keys, adding up (the quota may be for all keys together).
+  var block = quotaBlock(512);
+  var n = 0;
+  for (; n < 32; n++) {
+    var r = trySet(QUOTA_MULTI + n, block);
+    if (r !== 'ok') {
+      note('Key ' + (n + 1) + ' of 512 K: ' + r);
+      break;
+    }
+    if ((n + 1) % 4 === 0) {
+      note('Total so far: ' + ((n + 1) * 512) + ' K chars');
+    }
+  }
+  note('Total saved across keys: ' + (n * 512) + ' K chars' + (n === 32 ? ' (test limit, no error)' : ''));
+  for (var i = 0; i <= n && i < 32; i++) {
+    try { localStorage.removeItem(QUOTA_MULTI + i); } catch (e) {}
+  }
+  note('Storage after cleanup: ' + existingUsage());
+
+  save(STORE_QUOTA, null);
+  addRun(0, 0, ['Phone storage test'].concat(out));
+}
+
 Pebble.addEventListener('showConfiguration', function() {
+  var stopped = load(STORE_QUOTA, null);
+  if (stopped) {
+    // The test never finished: record how far it got and clean up.
+    save(STORE_QUOTA, null);
+    try { localStorage.removeItem(QUOTA_KEY); } catch (e) {}
+    for (var q = 0; q < 32; q++) {
+      try { localStorage.removeItem(QUOTA_MULTI + q); } catch (e) {}
+    }
+    addRun(0, 0, ['Phone storage test STOPPED part way (last step below)'].concat(stopped));
+  }
   var pending = load(STORE_PENDING, null);
   if (pending) {
     addRun(pending.sizeKB, 0, ['Phone built a ' + pending.urlKB + ' KB page URL',
@@ -329,6 +445,9 @@ Pebble.addEventListener('webviewclosed', function(e) {
     r && r.results ? r.results : ['Closed without results (' + text.length + ' chars back); next open has no padding']));
   // Backing out of a blank page lands here too, so start small again.
   save(STORE_NEXT, r && typeof r.next === 'number' ? r.next : 0);
+  if (r && r.storageTest) {
+    runStorageTest();
+  }
 });
 
 Pebble.addEventListener('ready', function() {
