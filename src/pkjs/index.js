@@ -246,28 +246,50 @@ function buildPage(state, pad) {
     '<h2>Finish</h2>' +
     '<label>Padding for the next open: <select id="nextKB"><option value="0">none</option>' +
     '<option value="256">256 KB</option><option value="512">512 KB</option><option value="1024">1 MB</option>' +
-    '<option value="2048">2 MB</option><option value="4096">4 MB</option></select></label><br>' +
+    '<option value="1152">1.125 MB</option><option value="1280">1.25 MB</option>' +
+    '<option value="1536">1.5 MB</option><option value="2048">2 MB</option><option value="4096">4 MB</option></select></label><br>' +
     '<button id="copyResults">Copy results</button><button id="close">Save results and close</button>' +
     '<h2>Earlier runs</h2><div id="runs"></div>' +
     '<textarea id="pad" readonly>' + pad + '</textarea>' +
     '<script>(' + pageMain.toString() + ')(' + json + ');</script></body></html>';
 }
 
-var s_lastUrlKB = 0;
-var s_lastSizeKB = 0;
+// The open in progress: {sizeKB, urlKB}. Still set at the next open means the
+// page never came back (it didn't load), so that open drops the padding.
+var STORE_PENDING = 'probePending';
+
+function addRun(sizeKB, returnKB, results) {
+  var runs = load(STORE_RUNS, []);
+  var d = new Date();
+  runs.push({
+    at: d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(),
+    sizeKB: sizeKB,
+    returnKB: returnKB,
+    results: results
+  });
+  save(STORE_RUNS, runs.slice(-8));
+}
 
 Pebble.addEventListener('showConfiguration', function() {
+  var pending = load(STORE_PENDING, null);
+  if (pending) {
+    addRun(pending.sizeKB, 0, ['Phone built a ' + pending.urlKB + ' KB page URL',
+                               'FAILED: that page never came back, so this open has no padding']);
+    save(STORE_NEXT, 0);
+  }
   var sizeKB = load(STORE_NEXT, 0);
   var pad = sizeKB ? padText(sizeKB) : '';
   var state = {sizeKB: sizeKB, padChars: pad.length, runs: load(STORE_RUNS, [])};
   var url = 'data:text/html;charset=utf-8,' + encodeURIComponent(buildPage(state, pad));
-  s_lastUrlKB = Math.round(url.length / 1024);
-  s_lastSizeKB = sizeKB;
-  console.log('Opening probe page: ' + s_lastUrlKB + ' KB URL, padding ' + sizeKB + ' KB');
+  var urlKB = Math.round(url.length / 1024);
+  save(STORE_PENDING, {sizeKB: sizeKB, urlKB: urlKB});
+  console.log('Opening probe page: ' + urlKB + ' KB URL, padding ' + sizeKB + ' KB');
   Pebble.openURL(url);
 });
 
 Pebble.addEventListener('webviewclosed', function(e) {
+  var pending = load(STORE_PENDING, null) || {sizeKB: 0, urlKB: 0};
+  save(STORE_PENDING, null);
   var text = (e && e.response) || '';
   var r = null;
   try {
@@ -279,19 +301,10 @@ Pebble.addEventListener('webviewclosed', function(e) {
       r = null;
     }
   }
-  var runs = load(STORE_RUNS, []);
-  var d = new Date();
-  runs.push({
-    at: d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(),
-    sizeKB: s_lastSizeKB,
-    returnKB: Math.round(text.length / 1024),
-    results: ['Phone built a ' + s_lastUrlKB + ' KB page URL'].concat(
-      r && r.results ? r.results : ['(page closed without results: ' + text.length + ' chars back)'])
-  });
-  save(STORE_RUNS, runs.slice(-6));
-  if (r && typeof r.next === 'number') {
-    save(STORE_NEXT, r.next);
-  }
+  addRun(pending.sizeKB, Math.round(text.length / 1024), ['Phone built a ' + pending.urlKB + ' KB page URL'].concat(
+    r && r.results ? r.results : ['Closed without results (' + text.length + ' chars back); next open has no padding']));
+  // Backing out of a blank page lands here too, so start small again.
+  save(STORE_NEXT, r && typeof r.next === 'number' ? r.next : 0);
 });
 
 Pebble.addEventListener('ready', function() {
