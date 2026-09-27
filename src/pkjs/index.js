@@ -1,11 +1,22 @@
-// RP Probe phone script: opens a test page in the Pebble app's WebView (as a
-// data: URL, like Royal Pebble's settings page) to find out whether the page
-// can save a file, share, copy large text, reach the internet, and how big the
-// page can get. Results come back through pebblejs://close# and are shown at
-// the top of the page the next time it opens.
+// RP Probe phone script, round 2 (Royal Pebble Phase 4 checks):
+//   1. Big result: how much the settings page can send back through
+//      pebblejs://close# (a pasted cruise bundle travels that way).
+//   2. Royal sign-in: whether Royal accepts a sign-in from the phone script,
+//      and whether a password with special characters survives the close URL.
+// Results are kept on the phone and shown at the top of the page the next time
+// it opens. They never hold the email, password, token or Royal's replies:
+// only sizes, yes/no checks, status codes and a booking count.
 
-var STORE_RUNS = 'probeRuns';   // [{at, sizeKB, urlKB, results: [text]}]
-var STORE_NEXT = 'probeNextKB'; // log-like padding to put in the next page
+var STORE_RUNS = 'probeRuns2';    // [{at, lines: [text]}], newest first
+var STORE_BUSY = 'probeBusy2';    // set while the sign-in test runs
+
+var APPKEY = 'hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm';
+var API = 'https://aws-prd.api.rccl.com';
+var LOGIN_URL = 'https://www.royalcaribbean.com/auth/oauth2/access_token';
+// Royal's public web-app client (the same value as Royal Pebble's cruise_sync.py).
+var LOGIN_CLIENT = 'Basic ZzlTMDIzdDc0NDczWlVrOTA5Rk42OEYwYjRONjdQU09oOTJvMDR2TDBCUjY1MzdwSTJ5Mmg5NE02QmJVN0Q2SjpX' +
+  'NjY4NDZrUFF2MTc1MDk3NW9vZEg1TTh6QzZUYTdtMzBrSDJRNzhsMldtVTUwRkNncXBQMTN3NzczNzdrN0lC';
+var TIMEOUT_MS = 30000;
 
 function load(key, fallback) {
   try {
@@ -17,439 +28,337 @@ function load(key, fallback) {
 }
 
 function save(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {}
 }
 
-// Made-up log lines (no real cabin numbers), about kb * 1024 characters.
-function padText(kb) {
-  var kinds = ['open', 'setting', 'sync', 'route', 'button', 'screen'];
-  var out = [];
-  var len = 0;
-  var i = 0;
-  while (len < kb * 1024) {
-    var m = i % 60;
-    var line = '2026-09-26 14:' + (m < 10 ? '0' : '') + m + ':12  D3 14:03  ' + kinds[i % kinds.length] +
-      '  entry ' + i + ': theme "light" -> dark, cabin 1234, 58 ms';
-    out.push(line);
-    len += line.length + 1;
-    i++;
-  }
-  return out.join('\n');
+function addRun(lines) {
+  var runs = load(STORE_RUNS, []);
+  runs.unshift({at: new Date().toString().slice(0, 24), lines: lines});
+  save(STORE_RUNS, runs.slice(0, 30));
 }
+
+// A short check value of a string, so the phone can tell whether text arrived
+// unchanged without anyone seeing it. The page uses the same function.
+function checkOf(s) {
+  var h = 5381;
+  for (var i = 0; i < s.length; i++) {
+    h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  }
+  return s.length + ':' + h.toString(16);
+}
+
+// Text with the characters that can break a URL: # & % + = ? / space, an
+// accented letter and an emoji.
+function trickyText() {
+  return 'a#b&c%d+e=f?g/h i:' + String.fromCharCode(233) + String.fromCharCode(0xD83D, 0xDE00) + '%41%';
+}
+
+// ------------------------------------------------------------------ the page
 
 function pageMain(S) {
   var $ = function(id) { return document.getElementById(id); };
-  var results = [];
-
-  function record(name, value) {
-    results.push(name + ': ' + value);
-    var li = document.createElement('li');
-    li.textContent = name + ': ' + value;
-    $('now').appendChild(li);
-  }
 
   // Earlier runs, newest first.
-  S.runs.slice().reverse().forEach(function(run) {
+  var box = $('runs');
+  if (S.busy) {
+    var b = document.createElement('div');
+    b.className = 'run busy';
+    b.textContent = 'The sign-in test started at ' + S.busy + ' is still running (or was stopped). ' +
+      'Keep RP Probe open on the watch and open this page again in a minute.';
+    box.appendChild(b);
+  }
+  if (!S.runs.length && !S.busy) {
+    box.textContent = 'No results yet.';
+  }
+  S.runs.forEach(function(run) {
     var d = document.createElement('div');
     d.className = 'run';
-    d.textContent = 'Run ' + run.at + ' (padding ' + run.sizeKB + ' KB, returned ' + run.returnKB + ' KB)\n' +
-      run.results.join('\n');
-    $('runs').appendChild(d);
+    d.textContent = run.at + '\n' + run.lines.join('\n');
+    box.appendChild(d);
   });
-  if (!S.runs.length) {
-    $('runs').textContent = 'No earlier runs yet.';
-  }
 
-  // 1. The page itself.
-  var pad = $('pad').value;
-  record('Page loaded', 'URL ' + Math.round(location.href.length / 1024) + ' KB, padding ' +
-         (pad.length >= S.padChars ? 'complete' : 'CUT OFF at ' + pad.length + ' of ' + S.padChars) +
-         ' (' + S.sizeKB + ' KB asked)');
-  record('Browser', navigator.userAgent);
-
-  // Automatic checks.
-  function tryClipboardApi(name, text) {
-    if (!navigator.clipboard || !navigator.clipboard.writeText) {
-      record(name, 'no clipboard API');
-      return;
+  function checkOf(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) {
+      h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
     }
-    navigator.clipboard.writeText(text).then(function() {
-      record(name, 'said OK (' + text.length + ' chars) - paste below to check');
-    }, function(e) {
-      record(name, 'refused: ' + e);
-    });
-  }
-  function tryExecCopy(name, text) {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'absolute';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
-    ta.select();
-    var ok = false;
-    try {
-      ok = document.execCommand('copy');
-    } catch (e) {
-      ok = false;
-    }
-    document.body.removeChild(ta);
-    record(name, (ok ? 'said OK (' : 'failed (') + text.length + ' chars) - paste below to check');
+    return s.length + ':' + h.toString(16);
   }
 
-  $('copyApi').onclick = function() { tryClipboardApi('Copy small, clipboard API', 'RP Probe small copy'); };
-  $('copyExec').onclick = function() { tryExecCopy('Copy small, execCommand', 'RP Probe small copy (exec)'); };
-  $('copyBig').onclick = function() {
-    tryExecCopy('Copy padding, execCommand', pad);
-  };
-  $('copyBigApi').onclick = function() {
-    tryClipboardApi('Copy padding, clipboard API', pad);
-  };
-  $('pasteBox').addEventListener('input', function() {
-    $('pasteLen').textContent = 'Pasted ' + $('pasteBox').value.length + ' characters.';
-  });
-  // Copies of a set size, made in the page, to find the clipboard's limit.
-  function sized(kb) {
-    var out = [];
+  // Made-up bundle-like JSON of about kb * 1024 characters: event rows with
+  // quotes and commas, like a real schedule, so the URL grows the same way.
+  function fakeBundle(kb) {
+    var titles = ['Trivia: Movie Quotes', 'Latin Dance Class', 'Pool Games', 'Karaoke', 'Art Auction Preview',
+                  'Voices (18+)', 'Family Shuffleboard', 'Jazz on 4', 'Sip & Paint', 'Ice Show: 365'];
+    var venues = ['Royal Promenade', 'Pool Deck', 'Studio B', 'Jazz on 4', 'Vintages', 'Royal Theater'];
+    var events = [];
     var len = 0;
-    for (var i = 0; len < kb * 1024; i++) {
-      var line = '2026-09-26 14:03:12  D3 14:03  button  entry ' + i + ': up, down, select';
-      out.push(line);
-      len += line.length + 1;
+    var i = 0;
+    while (len < kb * 1024) {
+      var e = [titles[i % titles.length] + ' ' + i, 600 + (i * 15) % 1200, 45, i % 6,
+               venues[i % venues.length], i % 5 ? null : 3, 'P' + (1000 + i % 400)];
+      events.push(e);
+      len += JSON.stringify(e).length + 1;
+      i++;
     }
-    return out.join(String.fromCharCode(10)).slice(0, kb * 1024);
+    return {format: 'cruise-watch', v: 1, fake: true, schedule: {events: events}, end: 'END'};
   }
-  Array.prototype.forEach.call(document.querySelectorAll('[data-copykb]'), function(b) {
-    b.onclick = function() {
-      var kb = +b.getAttribute('data-copykb');
-      tryExecCopy('Copy ' + kb + ' KB', sized(kb));
-    };
-  });
-  $('pasteClear').onclick = function() {
-    $('pasteBox').value = '';
-    $('pasteLen').textContent = '';
-  };
-  $('pasteRec').onclick = function() {
-    record('Pasted back', $('pasteBox').value.length + ' characters');
-  };
 
-  record('Share API', typeof navigator.share === 'function' ?
-         'present' + (navigator.canShare ? ', canShare present' : '') : 'missing');
-
-  $('net').onclick = function() {
-    record('Internet from page', 'trying...');
-    fetch('https://www.google.com/generate_204', {mode: 'no-cors'}).then(function() {
-      record('Internet from page', 'reached Google');
-    }, function(e) {
-      record('Internet from page', 'failed: ' + e);
-    });
-  };
-
-  // Links the user taps; they say what happened.
-  var small = 'Royal Pebble WebView probe test file.\nIf you can read this in a file, saving works.\n';
-  $('dlData').href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(small);
-  var blob = null;
-  var bigBlob = null;
-  try {
-    blob = new Blob([small], {type: 'text/plain'});
-    bigBlob = new Blob([pad || small], {type: 'text/plain'});
-    $('dlBlob').href = URL.createObjectURL(blob);
-    $('dlBig').href = URL.createObjectURL(bigBlob);
-  } catch (e) {
-    record('Blob', 'not available: ' + e);
+  function close(result) {
+    result.tricky = S.tricky;
+    result.trickyCheck = checkOf(S.tricky);
+    document.location = 'pebblejs://close#' + encodeURIComponent(JSON.stringify(result));
   }
-  $('mail').href = 'mailto:?subject=' + encodeURIComponent('RP Probe test') + '&body=' + encodeURIComponent(small);
-  $('intent').href = 'intent:#Intent;action=android.intent.action.SEND;type=text/plain;S.android.intent.extra.TEXT=' +
-    encodeURIComponent(small) + ';end';
 
-  $('shareText').onclick = function() {
-    if (typeof navigator.share !== 'function') {
-      record('Share text', 'no share API');
-      return;
-    }
-    navigator.share({title: 'RP Probe', text: small}).then(function() {
-      record('Share text', 'said OK');
-    }, function(e) {
-      record('Share text', 'refused: ' + e);
-    });
-  };
-  $('shareFile').onclick = function() {
-    if (typeof navigator.share !== 'function' || typeof File !== 'function') {
-      record('Share file', 'no share API or File');
-      return;
-    }
-    var f = new File([pad || small], 'royal-pebble-log-test.txt', {type: 'text/plain'});
-    if (navigator.canShare && !navigator.canShare({files: [f]})) {
-      record('Share file', 'canShare says no');
-      return;
-    }
-    navigator.share({files: [f], title: 'RP Probe'}).then(function() {
-      record('Share file', 'said OK');
-    }, function(e) {
-      record('Share file', 'refused: ' + e);
-    });
-  };
-  $('openBlob').onclick = function() {
-    var w = null;
-    try {
-      w = window.open(URL.createObjectURL(blob), '_blank');
-    } catch (e) {
-      record('Open as text page', 'error: ' + e);
-      return;
-    }
-    record('Open as text page', w ? 'window.open returned a window' : 'window.open returned nothing');
+  $('sendBig').onclick = function() {
+    var kb = parseInt($('bigKB').value, 10);
+    var bundle = fakeBundle(kb);
+    var text = JSON.stringify(bundle);
+    var urlChars = encodeURIComponent(JSON.stringify({test: 'big', kb: kb, bundle: bundle})).length;
+    $('bigNote').textContent = 'Sending ' + Math.round(text.length / 1024) + ' KB of JSON (' +
+      Math.round(urlChars / 1024) + ' KB in the URL)...';
+    close({test: 'big', kb: kb, jsonChars: text.length, urlChars: urlChars, check: checkOf(text), bundle: bundle});
   };
 
-  // Worked / Didn't buttons beside each manual test.
-  Array.prototype.forEach.call(document.querySelectorAll('[data-ask]'), function(row) {
-    var name = row.getAttribute('data-ask');
-    ['Worked', 'Nothing', 'Error'].forEach(function(label) {
-      var b = document.createElement('button');
-      b.className = 'small';
-      b.textContent = label;
-      b.onclick = function() { record(name, 'you said: ' + label); };
-      row.appendChild(b);
-    });
-  });
+  $('signIn').onclick = function() {
+    var email = $('email').value.trim();
+    var password = $('password').value;
+    if (!email || !password) {
+      $('signNote').textContent = 'Type your email and password first.';
+      return;
+    }
+    $('password').value = '';
+    close({test: 'login', email: email, password: password, passwordCheck: checkOf(password),
+           bookings: $('bookings').checked});
+  };
 
-  $('copyResults').onclick = function() {
-    tryExecCopy('Copy results', results.join('\n'));
+  $('trickyOnly').onclick = function() {
+    close({test: 'tricky'});
   };
-  $('close').onclick = function() {
-    var next = parseInt($('nextKB').value, 10) || 0;
-    document.location = 'pebblejs://close#' + encodeURIComponent(JSON.stringify({
-      results: results, next: next, storageTest: $('storageTest').checked
-    }));
-  };
-  $('nextKB').value = String(S.sizeKB);
 }
 
 var CSS = 'body{font:16px sans-serif;margin:12px;background:#fff;color:#111}' +
-  'h1{font-size:20px}h2{font-size:17px;margin:18px 0 6px}' +
-  'button,a.btn{display:inline-block;margin:4px 4px 4px 0;padding:10px 12px;font-size:15px;border:1px solid #888;' +
-  'border-radius:8px;background:#eef;color:#003;text-decoration:none}' +
-  'button.small{padding:6px 8px;font-size:13px;background:#f4f4f4}' +
-  '.row{margin:8px 0;padding:8px;border:1px solid #ddd;border-radius:8px}' +
+  'h1{font-size:20px}h2{font-size:17px;margin:20px 0 6px}p{margin:6px 0}' +
+  'button{display:inline-block;margin:6px 4px 6px 0;padding:10px 12px;font-size:15px;border:1px solid #888;' +
+  'border-radius:8px;background:#eef;color:#003}' +
+  'input[type=email],input[type=password],select{font-size:16px;padding:8px;width:100%;box-sizing:border-box;margin:4px 0}' +
+  '.card{margin:10px 0;padding:10px;border:1px solid #ddd;border-radius:8px}' +
   '.run{white-space:pre-wrap;font:12px monospace;background:#f6f6f6;padding:8px;margin:6px 0;border-radius:6px}' +
-  '#now li{font:13px monospace;margin:3px 0}textarea{width:100%;height:70px}' +
-  '#pad{position:absolute;left:-9999px;width:10px;height:10px}';
+  '.busy{background:#fff4d6}.small{font-size:13px;color:#444}';
 
-function row(inner, ask) {
-  return '<div class="row"' + (ask ? ' data-ask="' + ask + '"' : '') + '>' + inner + '<br></div>';
-}
-
-function buildPage(state, pad) {
-  var json = JSON.stringify(state).replace(/</g, '\\u003c');
+function buildPage(state) {
+  var json = JSON.stringify(state).split('<').join(String.fromCharCode(92) + 'u003c');
+  var sizes = [64, 128, 192, 256, 384, 512, 768, 1024];
   return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>RP Probe</title><style>' + CSS + '</style></head><body>' +
-    '<h1>RP Probe</h1><p>Tap each test. For links, come back to this page and say what happened. ' +
-    'Then tap Save results at the bottom.</p>' +
-    '<h2>This run</h2><ol id="now"></ol>' +
-    '<h2>Save a file</h2>' +
-    row('<a class="btn" id="dlData" download="royal-pebble-log-test.txt">Download (data link)</a>',
-        'Download data link') +
-    row('<a class="btn" id="dlBlob" download="royal-pebble-log-test.txt">Download (blob link)</a>',
-        'Download blob link') +
-    row('<a class="btn" id="dlBig" download="royal-pebble-log-big.txt">Download padding (blob, ' +
-        state.sizeKB + ' KB)</a>', 'Download padding') +
-    row('<button id="openBlob">Open as text page</button>', 'Open as text page') +
-    '<h2>Share</h2>' +
-    row('<button id="shareText">Share text</button>', 'Share text') +
-    row('<button id="shareFile">Share as file</button>', 'Share file') +
-    row('<a class="btn" id="intent">Android share (intent link)</a>', 'Android intent') +
-    row('<a class="btn" id="mail">Email (mailto link)</a>', 'Email link') +
-    '<h2>Copy</h2>' +
-    row('<button id="copyApi">Copy small (clipboard API)</button><button id="copyExec">Copy small (execCommand)</button>' +
-        '<button id="copyBig">Copy padding (execCommand)</button><button id="copyBigApi">Copy padding (clipboard API)</button>' +
-        '<p>Copy a set size:</p>' + [32, 64, 128, 256, 384, 512].map(function(kb) {
-          return '<button data-copykb="' + kb + '">' + kb + ' KB</button>';
-        }).join('') +
-        '<p>Long-press here and Paste after each copy:</p><textarea id="pasteBox"></textarea>' +
-        '<p id="pasteLen"></p><button id="pasteRec">Record pasted length</button><button id="pasteClear">Clear box</button>') +
-    '<h2>Internet</h2>' +
-    row('<button id="net">Try to reach Google from the page</button>') +
-    '<h2>Finish</h2>' +
-    '<label>Padding for the next open: <select id="nextKB"><option value="0">none</option>' +
-    '<option value="256">256 KB</option><option value="512">512 KB</option><option value="1024">1 MB</option>' +
-    '<option value="1152">1.125 MB</option><option value="1280">1.25 MB</option>' +
-    '<option value="1536">1.5 MB</option><option value="2048">2 MB</option><option value="4096">4 MB</option></select></label><br>' +
-    '<label><input type="checkbox" id="storageTest"> Test phone storage after closing ' +
-    '(takes up to a minute; keep the app open on the watch, then open this page again)</label><br>' +
-    '<button id="copyResults">Copy results</button><button id="close">Save results and close</button>' +
-    '<h2>Earlier runs</h2><div id="runs"></div>' +
-    '<textarea id="pad" readonly>' + pad + '</textarea>' +
+    '<h1>RP Probe 2</h1>' +
+    '<p class="small">Keep RP Probe open on the watch while you test: the phone script only runs then. ' +
+    'Each button closes this page; open it again to see the result at the top.</p>' +
+    '<h2>Results</h2><div id="runs"></div>' +
+    '<h2>1. Big result back</h2><div class="card">' +
+    '<p>Sends a made-up cruise bundle of this size back to the phone script, the way Save sends a pasted ' +
+    'bundle. Start at 128 KB and go up until one fails.</p>' +
+    '<select id="bigKB">' + sizes.map(function(kb) {
+      return '<option value="' + kb + '"' + (kb === 128 ? ' selected' : '') + '>' + kb + ' KB</option>';
+    }).join('') + '</select>' +
+    '<button id="sendBig">Send back and close</button><p class="small" id="bigNote"></p></div>' +
+    '<h2>2. Royal sign-in</h2><div class="card">' +
+    '<p>Signs in to Royal Caribbean once from the phone script, then (if ticked) asks for your bookings ' +
+    'list. The result shows only status codes, a booking count and yes/no checks.</p>' +
+    '<p class="small">Your email and password go from this page to RP Probe\'s phone script inside the ' +
+    'Pebble app, and from there only to Royal Caribbean. Nothing saves or logs them.</p>' +
+    '<input type="email" id="email" placeholder="Royal email" autocomplete="off" autocapitalize="off" spellcheck="false">' +
+    '<input type="password" id="password" placeholder="Royal password" autocomplete="off">' +
+    '<label><input type="checkbox" id="bookings" checked> Also fetch the bookings list</label><br>' +
+    '<button id="signIn">Sign in test and close</button><p class="small" id="signNote"></p></div>' +
+    '<h2>3. Special characters only</h2><div class="card">' +
+    '<p>Sends test text with # &amp; % + = ? / and an emoji back, with no login. (Tests 1 and 2 check it too.)</p>' +
+    '<button id="trickyOnly">Send and close</button></div>' +
     '<script>(' + pageMain.toString() + ')(' + json + ');</script></body></html>';
 }
 
-// The open in progress: {sizeKB, urlKB}. Still set at the next open means the
-// page never came back (it didn't load), so that open drops the padding.
-var STORE_PENDING = 'probePending';
+// ------------------------------------------------------------- phone script
 
-function addRun(sizeKB, returnKB, results) {
-  var runs = load(STORE_RUNS, []);
-  var d = new Date();
-  runs.push({
-    at: d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(),
-    sizeKB: sizeKB,
-    returnKB: returnKB,
-    results: results
-  });
-  save(STORE_RUNS, runs.slice(-8));
-}
-
-// Phone storage quota test. Royal Pebble's usage log (up to 768 KB of text)
-// lives in the phone script's localStorage beside the cruise bundle, so this
-// finds how much that storage takes: one key growing to 8 MB, then 512 KB keys
-// adding up to 16 MB. Sizes are in K characters (JS strings; a store may count
-// 2 bytes each). Every test key is removed afterwards. Progress is saved after
-// each step, so a script that gets stopped part way still leaves a result.
-var STORE_QUOTA = 'probeQuotaProgress'; // [text] while the test runs
-var QUOTA_KEY = 'probeQuotaTest';
-var QUOTA_MULTI = 'probeQuotaMulti';
-
-function quotaBlock(kb) {
-  var s = padText(64).slice(0, 64 * 1024);
-  while (s.length < kb * 1024) {
-    s += s;
-  }
-  return s.slice(0, kb * 1024);
-}
-
-function trySet(key, value) {
+// The page's result: the Pebble app may hand it over still URL-encoded or
+// already decoded, so try both and say which.
+function readResponse(text) {
   try {
-    localStorage.setItem(key, value);
-    var back = localStorage.getItem(key);
-    return back !== null && back.length === value.length ? 'ok' : 'read back ' + (back ? back.length : 'nothing');
-  } catch (e) {
-    return 'error: ' + e;
-  }
-}
-
-function existingUsage() {
-  var chars = 0;
-  var keys = 0;
+    return {r: JSON.parse(decodeURIComponent(text)), how: 'URL-encoded'};
+  } catch (e) {}
   try {
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      var v = localStorage.getItem(k);
-      chars += k.length + (v ? v.length : 0);
-      keys++;
-    }
-  } catch (e) {
-    return 'could not count: ' + e;
-  }
-  return keys + ' keys, ' + Math.round(chars / 1024) + ' K chars';
+    return {r: JSON.parse(text), how: 'already decoded'};
+  } catch (e2) {}
+  return {r: null, how: 'unreadable'};
 }
 
-function runStorageTest() {
-  var out = [];
-  function note(text) {
-    out.push(text);
-    try { save(STORE_QUOTA, out); } catch (e) {} // storage may be full right now
-    console.log('Storage test: ' + text);
+function trickyLine(r) {
+  if (typeof r.tricky !== 'string') {
+    return 'Special characters: not sent';
   }
-  note('Storage before test: ' + existingUsage());
+  var ok = r.tricky === trickyText() && checkOf(r.tricky) === r.trickyCheck;
+  return 'Special characters (# & % + = ? / emoji): ' + (ok ? 'arrived intact' : 'CHANGED on the way');
+}
 
-  // 1. One key, growing.
-  var best = 0;
-  [256, 512, 768, 1024, 2048, 3072, 4096, 6144, 8192].some(function(kb) {
-    var t0 = Date.now();
-    var r = trySet(QUOTA_KEY, quotaBlock(kb));
-    note('One key ' + kb + ' K: ' + r + ' (' + (Date.now() - t0) + ' ms)');
-    if (r !== 'ok') {
-      return true;
+function bigResult(r, rawChars, how) {
+  var lines = ['Big result: ' + r.kb + ' KB asked'];
+  lines.push('Page sent ' + Math.round(r.jsonChars / 1024) + ' KB of JSON, ' +
+             Math.round(r.urlChars / 1024) + ' KB in the URL');
+  lines.push('Phone got ' + Math.round(rawChars / 1024) + ' KB (' + how + ')');
+  var text = r.bundle ? JSON.stringify(r.bundle) : '';
+  var whole = r.bundle && r.bundle.end === 'END' && checkOf(text) === r.check;
+  lines.push(whole ? 'OK: the bundle arrived whole' : 'FAILED: the bundle arrived cut or changed');
+  lines.push(trickyLine(r));
+  addRun(lines);
+}
+
+// Reads the account id from the token's middle part (base64url JSON), without
+// keeping the token.
+function accountOf(token) {
+  var part = String(token || '').split('.')[1] || '';
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  var bits = 0;
+  var value = 0;
+  var out = '';
+  for (var i = 0; i < part.length; i++) {
+    var n = chars.indexOf(part.charAt(i));
+    if (n < 0) {
+      continue;
     }
-    best = kb;
-    return false;
+    value = ((value << 6) | n) & 0xFFFFFF;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out += String.fromCharCode((value >> bits) & 255);
+    }
+  }
+  try {
+    return JSON.parse(out).sub || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function statusWord(status) {
+  if (status === 200) return 'OK';
+  if (status === 403) return 'BLOCKED (403)';
+  if (status === 400 || status === 401) return 'refused the login (' + status + ': wrong email or password?)';
+  if (status === 0) return 'no answer (network error or blocked before reaching Royal)';
+  return 'error ' + status;
+}
+
+function request(method, url, headers, body, done) {
+  var xhr = new XMLHttpRequest();
+  var started = Date.now();
+  var finished = false;
+  function end(status, text, note) {
+    if (finished) return;
+    finished = true;
+    done(status, text, Date.now() - started, note);
+  }
+  try {
+    xhr.open(method, url, true);
+    Object.keys(headers).forEach(function(k) {
+      xhr.setRequestHeader(k, headers[k]);
+    });
+    xhr.timeout = TIMEOUT_MS;
+    xhr.onload = function() { end(xhr.status, xhr.responseText, ''); };
+    xhr.onerror = function() { end(0, '', 'network error'); };
+    xhr.ontimeout = function() { end(0, '', 'timed out after ' + TIMEOUT_MS / 1000 + ' s'); };
+    xhr.send(body);
+  } catch (e) {
+    end(0, '', 'could not send: ' + e.message);
+  }
+}
+
+function loginTest(r, how) {
+  var lines = ['Royal sign-in (' + how + ')'];
+  var intact = typeof r.password === 'string' && checkOf(r.password) === r.passwordCheck;
+  lines.push('Password arrived intact: ' + (intact ? 'yes' : 'NO'));
+  lines.push(trickyLine(r));
+  var body = 'grant_type=password&username=' + encodeURIComponent(r.email || '') +
+    '&password=' + encodeURIComponent(r.password || '') + '&scope=openid+profile+email+vdsid';
+  var wantBookings = !!r.bookings;
+  r.email = r.password = null;
+  save(STORE_BUSY, new Date().toString().slice(16, 24));
+
+  function finish() {
+    save(STORE_BUSY, null);
+    addRun(lines);
+  }
+
+  request('POST', LOGIN_URL, {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Authorization': LOGIN_CLIENT,
+    'Accept': 'application/json'
+  }, body, function(status, text, ms, note) {
+    body = null;
+    lines.push('Sign-in: ' + statusWord(status) + ', ' + ms + ' ms' + (note ? ', ' + note : ''));
+    var token = null;
+    if (status === 200) {
+      try {
+        token = JSON.parse(text).access_token || null;
+      } catch (e) {}
+    }
+    text = null;
+    var account = token ? accountOf(token) : null;
+    if (status === 200) {
+      lines.push('Token: ' + (token ? 'received' : 'MISSING') + ', account id ' + (account ? 'read' : 'NOT read'));
+    }
+    if (!token || !account || !wantBookings) {
+      finish();
+      return;
+    }
+    request('GET', API + '/v1/profileBookings/enriched/' + encodeURIComponent(account) +
+            '?brand=R&includeCheckin=true', {
+      'AppKey': APPKEY,
+      'Accept': 'application/json',
+      'Access-Token': token,
+      'account-id': account,
+      'vds-id': account
+    }, null, function(status2, text2, ms2, note2) {
+      token = account = null;
+      lines.push('Bookings list: ' + statusWord(status2) + ', ' + ms2 + ' ms' + (note2 ? ', ' + note2 : ''));
+      if (status2 === 200) {
+        var count = null;
+        try {
+          var list = (JSON.parse(text2).payload || {}).profileBookings;
+          count = list ? list.length : null;
+        } catch (e) {}
+        lines.push(count === null ? 'Bookings: reply not readable' : 'Bookings on the account: ' + count);
+      }
+      text2 = null;
+      finish();
+    });
   });
-  try { localStorage.removeItem(QUOTA_KEY); } catch (e) {}
-  note('Largest single value saved: ' + best + ' K chars');
-
-  // 2. Log-sized save and load timing (the log is saved after new entries).
-  var log = JSON.stringify([quotaBlock(768)]);
-  var t1 = Date.now();
-  var r768 = trySet(QUOTA_KEY, log);
-  var t2 = Date.now();
-  var parsed = null;
-  try { parsed = JSON.parse(localStorage.getItem(QUOTA_KEY)); } catch (e) {}
-  note('768 K log as JSON: save ' + r768 + ' in ' + (t2 - t1) + ' ms, load and parse ' +
-       (parsed ? 'ok' : 'failed') + ' in ' + (Date.now() - t2) + ' ms');
-  try { localStorage.removeItem(QUOTA_KEY); } catch (e) {}
-
-  // 3. Many 512 K keys, adding up (the quota may be for all keys together).
-  var block = quotaBlock(512);
-  var n = 0;
-  for (; n < 32; n++) {
-    var r = trySet(QUOTA_MULTI + n, block);
-    if (r !== 'ok') {
-      note('Key ' + (n + 1) + ' of 512 K: ' + r);
-      break;
-    }
-    if ((n + 1) % 4 === 0) {
-      note('Total so far: ' + ((n + 1) * 512) + ' K chars');
-    }
-  }
-  note('Total saved across keys: ' + (n * 512) + ' K chars' + (n === 32 ? ' (test limit, no error)' : ''));
-  for (var i = 0; i <= n && i < 32; i++) {
-    try { localStorage.removeItem(QUOTA_MULTI + i); } catch (e) {}
-  }
-  note('Storage after cleanup: ' + existingUsage());
-
-  save(STORE_QUOTA, null);
-  addRun(0, 0, ['Phone storage test'].concat(out));
 }
 
 Pebble.addEventListener('showConfiguration', function() {
-  var stopped = load(STORE_QUOTA, null);
-  if (stopped) {
-    // The test never finished: record how far it got and clean up.
-    save(STORE_QUOTA, null);
-    try { localStorage.removeItem(QUOTA_KEY); } catch (e) {}
-    for (var q = 0; q < 32; q++) {
-      try { localStorage.removeItem(QUOTA_MULTI + q); } catch (e) {}
-    }
-    addRun(0, 0, ['Phone storage test STOPPED part way (last step below)'].concat(stopped));
-  }
-  var pending = load(STORE_PENDING, null);
-  if (pending) {
-    addRun(pending.sizeKB, 0, ['Phone built a ' + pending.urlKB + ' KB page URL',
-                               'FAILED: that page never came back, so this open has no padding']);
-    save(STORE_NEXT, 0);
-  }
-  var sizeKB = load(STORE_NEXT, 0);
-  var pad = sizeKB ? padText(sizeKB) : '';
-  var state = {sizeKB: sizeKB, padChars: pad.length, runs: load(STORE_RUNS, [])};
-  var url = 'data:text/html;charset=utf-8,' + encodeURIComponent(buildPage(state, pad));
-  var urlKB = Math.round(url.length / 1024);
-  save(STORE_PENDING, {sizeKB: sizeKB, urlKB: urlKB});
-  console.log('Opening probe page: ' + urlKB + ' KB URL, padding ' + sizeKB + ' KB');
-  Pebble.openURL(url);
+  var state = {runs: load(STORE_RUNS, []), busy: load(STORE_BUSY, null), tricky: trickyText()};
+  Pebble.openURL('data:text/html;charset=utf-8,' + encodeURIComponent(buildPage(state)));
 });
 
 Pebble.addEventListener('webviewclosed', function(e) {
-  var pending = load(STORE_PENDING, null) || {sizeKB: 0, urlKB: 0};
-  save(STORE_PENDING, null);
   var text = (e && e.response) || '';
-  var r = null;
-  try {
-    r = JSON.parse(decodeURIComponent(text));
-  } catch (err) {
-    try {
-      r = JSON.parse(text);
-    } catch (err2) {
-      r = null;
-    }
+  if (!text) {
+    addRun(['Page closed with no result (backed out, or the result was too big to arrive at all)']);
+    return;
   }
-  addRun(pending.sizeKB, Math.round(text.length / 1024), ['Phone built a ' + pending.urlKB + ' KB page URL'].concat(
-    r && r.results ? r.results : ['Closed without results (' + text.length + ' chars back); next open has no padding']));
-  // Backing out of a blank page lands here too, so start small again.
-  save(STORE_NEXT, r && typeof r.next === 'number' ? r.next : 0);
-  if (r && r.storageTest) {
-    runStorageTest();
+  var got = readResponse(text);
+  var r = got.r;
+  if (!r) {
+    addRun(['Result not readable: ' + Math.round(text.length / 1024) + ' KB arrived (probably cut short)']);
+  } else if (r.test === 'big') {
+    bigResult(r, text.length, got.how);
+  } else if (r.test === 'login') {
+    loginTest(r, got.how);
+  } else {
+    addRun(['Special characters only (' + got.how + ')', trickyLine(r)]);
   }
 });
 
 Pebble.addEventListener('ready', function() {
-  console.log('RP Probe ready');
+  console.log('RP Probe 2 ready');
 });
