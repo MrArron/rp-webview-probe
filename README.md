@@ -19,5 +19,22 @@ Its results are in Royal Pebble's `docs/PROJECT_BRIEF.md` (Export design).
    Results hold only status codes, timings, a booking count and yes/no checks;
    the email, password, token and Royal's replies are never saved or logged.
 
-Keep RP Probe open on the watch while testing, open its settings in the Pebble
+**Round 3 (Royal Pebble Phase 5, voice)** tests whether dictation works with no
+internet. The watch app now starts a dictation session on Select and shows the
+status, how long it took and the text it heard. The confirm screen and the
+firmware's error dialogs are off, so every failure shows its real status
+(`CONNECTIVITY error` is the one that means "needs the internet").
+
+1. In the Pebble app, set speech recognition to local and download the local
+   package.
+2. With the phone online, press Select and say the phrase on screen (Up/Down pick
+   one of seven, including a made-up cabin number). This checks the app works.
+3. Airplane mode on, Bluetooth back on. Repeat each phrase. **Pass = text comes
+   back.**
+4. Try a noisy room (TV or music on) and a few phrases away from the phone.
+
+Hold Select for the history (last 8 results, kept after closing the app). Report
+the counts and any heard text that went wrong; the history holds no personal data.
+
+Rounds 1-2: keep RP Probe open on the watch while testing, open its settings in the Pebble
 app, and reopen the page after each test to read the result at the top.
